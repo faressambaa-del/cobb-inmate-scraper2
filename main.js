@@ -26,25 +26,6 @@ const INQUIRY_URL = [
 
 console.log(`Searching → name="${name}"  mode="${mode}"`);
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/**
- * Determine whether a scraped record represents a RELEASED inmate.
- */
-function isReleased(record) {
-    if (record.releaseDate && record.releaseDate.trim().length > 0) return true;
-
-    const status = (record.inmateStatus || '').toLowerCase();
-    if (/released|discharge|transferr|out of custody|bonded out|posted bond/i.test(status)) return true;
-    if (/in custody|current|active/i.test(status)) return false;
-
-    const rawValues = Object.values(record._raw || {}).join(' ').toLowerCase();
-    if (/released|discharge|bonded out|transferr/i.test(rawValues)) return true;
-
-    return false;
-}
-
-/** Convert a messy table into { label: value } pairs */
 function parseTableToObject(rows) {
     const obj = {};
     for (const cells of rows) {
@@ -59,7 +40,16 @@ function parseTableToObject(rows) {
     return obj;
 }
 
-/** Extract named fields from the raw key-value map */
+function isReleased(record) {
+    if (record.releaseDate && record.releaseDate.trim().length > 0) return true;
+    const status = (record.inmateStatus || '').toLowerCase();
+    if (/released|discharge|transferr|out of custody|bonded out|posted bond/i.test(status)) return true;
+    if (/in custody|current|active/i.test(status)) return false;
+    const rawValues = Object.values(record._raw || {}).join(' ').toLowerCase();
+    if (/released|discharge|bonded out|transferr/i.test(rawValues)) return true;
+    return false;
+}
+
 function buildStructuredRecord(rawMap, sourceUrl) {
     const find = (...keys) => {
         for (const k of keys) {
@@ -102,8 +92,6 @@ function buildStructuredRecord(rawMap, sourceUrl) {
     };
 }
 
-// ── Scrape table rows ─────────────────────────────────────────────────────────
-
 async function scrapeTableRows(page) {
     return page.evaluate(() => {
         const rows = [];
@@ -115,8 +103,6 @@ async function scrapeTableRows(page) {
         return rows;
     });
 }
-
-// ── Crawler ───────────────────────────────────────────────────────────────────
 
 const results = [];
 
@@ -150,14 +136,14 @@ const crawler = new PlaywrightCrawler({
         },
     ],
 
-    requestHandlerTimeoutSecs : 120,
-    navigationTimeoutSecs     : 60,
+    requestHandlerTimeoutSecs : 300,
+    navigationTimeoutSecs     : 120,
     maxRequestRetries         : 3,
 
     async requestHandler({ page, request, log }) {
         log.info(`Processing: ${request.url}`);
 
-        await page.waitForSelector('body', { timeout: 30000 });
+        await page.waitForSelector('body', { timeout: 60000 });
         const pageText = (await page.textContent('body')) || '';
 
         if (/no record/i.test(pageText) || /not found/i.test(pageText)) {
@@ -166,7 +152,6 @@ const crawler = new PlaywrightCrawler({
             return;
         }
 
-        // Intercept all window.open calls from booking buttons
         const detailUrls = await page.evaluate(() => {
             const captured = [];
             const originalOpen = window.open;
@@ -180,7 +165,6 @@ const crawler = new PlaywrightCrawler({
             return captured;
         });
 
-        // Backup: extract InmDetails URLs from raw HTML
         const html = await page.content();
         const htmlMatches = [...html.matchAll(/InmDetails\.asp\?[^"'<>\s]+/g)]
             .map(m => m[0].replace(/&amp;/g, '&'));
@@ -197,7 +181,7 @@ const crawler = new PlaywrightCrawler({
             const rawMap = parseTableToObject(rows);
             const record = buildStructuredRecord(rawMap, page.url());
             if (!isReleased(record)) {
-                log.info('⏭  Skipping — inmate appears to still be in custody');
+                log.info('⏭  Skipping — inmate still in custody');
                 return;
             }
             results.push({ found: true, ...record });
@@ -207,18 +191,18 @@ const crawler = new PlaywrightCrawler({
         for (const detailUrl of allDetailUrls) {
             log.info(`Navigating to detail: ${detailUrl}`);
             try {
-                await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                await page.waitForSelector('table', { timeout: 15000 }).catch(() => {});
+                await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
+                await page.waitForSelector('table', { timeout: 30000 }).catch(() => {});
 
                 const rows   = await scrapeTableRows(page);
                 const rawMap = parseTableToObject(rows);
                 const record = buildStructuredRecord(rawMap, page.url());
-
                 const released = isReleased(record);
+
                 log.info(`✅ Parsed: ${record.name || '(unknown)'} | released=${released}`);
 
                 if (!released) {
-                    log.info('⏭  Skipping — inmate appears to still be in custody');
+                    log.info('⏭  Skipping — inmate still in custody');
                     continue;
                 }
 
@@ -236,8 +220,6 @@ const crawler = new PlaywrightCrawler({
         results.push({ found: false, error: error?.message, sourceUrl: request.url, scrapedAt: new Date().toISOString() });
     },
 });
-
-// ── Run ───────────────────────────────────────────────────────────────────────
 
 await crawler.run([{ url: INQUIRY_URL }]);
 
