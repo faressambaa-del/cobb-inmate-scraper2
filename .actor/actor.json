@@ -17,13 +17,13 @@
       },
       "soid": {
         "title": "SOID Number (optional)",
-        "description": "SOID number for faster lookup",
+        "description": "SOID number for faster lookup, leave blank to search by name",
         "type": "string",
         "editor": "textfield"
       },
       "serial": {
         "title": "Serial Number (optional)",
-        "description": "Serial number for lookup",
+        "description": "Serial number for lookup, leave blank if unknown",
         "type": "string",
         "editor": "textfield"
       },
@@ -37,18 +37,20 @@
       },
       "proxyUsername": {
         "title": "WebShare Proxy Username",
+        "description": "Your WebShare proxy username for rotating proxies",
         "type": "string",
         "editor": "textfield"
       },
       "proxyPassword": {
         "title": "WebShare Proxy Password",
+        "description": "Your WebShare proxy password for rotating proxies",
         "type": "string",
         "editor": "textfield",
         "isSecret": true
       },
       "proxyList": {
         "title": "Proxy List",
-        "description": "Array of proxy IPs with ports e.g. [\"12.34.56.78:8080\"]",
+        "description": "Array of proxy IPs with ports e.g. [\"12.34.56.78:8080\", \"23.45.67.89:8080\"]",
         "type": "array",
         "editor": "json",
         "default": []
