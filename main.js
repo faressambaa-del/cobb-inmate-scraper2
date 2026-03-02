@@ -1,3 +1,5 @@
+
+cat > /home/claude/scraper/ccobb-inmate-scraper-improved/main.js << 'ENDOFFILE'
 import { Actor } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration } from 'crawlee';
 
@@ -26,6 +28,8 @@ const INQUIRY_URL = [
 
 console.log(`Searching → name="${name}"  mode="${mode}"`);
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 function parseTableToObject(rows) {
     const obj = {};
     for (const cells of rows) {
@@ -40,17 +44,7 @@ function parseTableToObject(rows) {
     return obj;
 }
 
-function isReleased(record) {
-    if (record.releaseDate && record.releaseDate.trim().length > 0) return true;
-    const status = (record.inmateStatus || '').toLowerCase();
-    if (/released|discharge|transferr|out of custody|bonded out|posted bond/i.test(status)) return true;
-    if (/in custody|current|active/i.test(status)) return false;
-    const rawValues = Object.values(record._raw || {}).join(' ').toLowerCase();
-    if (/released|discharge|bonded out|transferr/i.test(rawValues)) return true;
-    return false;
-}
-
-function buildStructuredRecord(rawMap, sourceUrl) {
+function buildStructuredRecord(rawMap, sourceUrl, listingReleased) {
     const find = (...keys) => {
         for (const k of keys) {
             const match = Object.entries(rawMap).find(([label]) =>
@@ -66,29 +60,29 @@ function buildStructuredRecord(rawMap, sourceUrl) {
         .map(([label, value]) => ({ label, value }));
 
     return {
-        name             : find('name', 'inmate'),
-        soid             : find('soid', 'id'),
-        dob              : find('birth', 'dob', 'date of birth'),
-        race             : find('race'),
-        sex              : find('sex', 'gender'),
-        height           : find('height'),
-        weight           : find('weight'),
-        hair             : find('hair'),
-        eyes             : find('eye'),
-        bookingNumber    : find('booking number', 'booking #', 'book no'),
-        bookingDate      : find('booking date', 'booked', 'arrest date'),
-        arrestingAgency  : find('arresting agency', 'agency'),
-        arrestDate       : find('arrest date'),
-        facility         : find('facility', 'location', 'housing'),
-        inmateStatus     : find('status', 'custody', 'in custody'),
-        releaseDate      : find('release date', 'released'),
-        releaseReason    : find('release reason', 'reason'),
-        bondAmount       : find('bond amount', 'bond', 'bail'),
-        bondType         : find('bond type'),
-        charges          : chargeRows.length > 0 ? chargeRows : find('charge', 'offense'),
+        name            : find('name', 'inmate'),
+        soid            : find('soid', 'id'),
+        dob             : find('birth', 'dob', 'date of birth'),
+        race            : find('race'),
+        sex             : find('sex', 'gender'),
+        height          : find('height'),
+        weight          : find('weight'),
+        hair            : find('hair'),
+        eyes            : find('eye'),
+        bookingNumber   : find('booking number', 'booking #', 'book no'),
+        bookingDate     : find('booking date', 'booked', 'arrest date'),
+        arrestingAgency : find('arresting agency', 'agency'),
+        arrestDate      : find('arrest date'),
+        facility        : find('facility', 'location', 'housing'),
+        inmateStatus    : listingReleased ? 'RELEASED' : find('status', 'custody', 'in custody'),
+        releaseDate     : find('release date', 'released'),
+        releaseReason   : find('release reason', 'reason'),
+        bondAmount      : find('bond amount', 'bond', 'bail'),
+        bondType        : find('bond type'),
+        charges         : chargeRows.length > 0 ? chargeRows : find('charge', 'offense'),
         sourceUrl,
-        scrapedAt        : new Date().toISOString(),
-        _raw             : rawMap,
+        scrapedAt       : new Date().toISOString(),
+        _raw            : rawMap,
     };
 }
 
@@ -103,6 +97,8 @@ async function scrapeTableRows(page) {
         return rows;
     });
 }
+
+// ── Crawler ───────────────────────────────────────────────────────────────────
 
 const results = [];
 
@@ -132,7 +128,8 @@ const crawler = new PlaywrightCrawler({
                 'User-Agent'      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept-Language' : 'en-US,en;q=0.9',
             });
-            await page.route('**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,css}', route => route.abort());
+            // Only block images — keep CSS/JS so buttons and tables render correctly
+            await page.route('**/*.{png,jpg,jpeg,gif,ico}', route => route.abort());
         },
     ],
 
@@ -144,104 +141,94 @@ const crawler = new PlaywrightCrawler({
         log.info(`Processing: ${request.url}`);
 
         await page.waitForSelector('body', { timeout: 60000 });
-        const pageText = (await page.textContent('body')) || '';
 
+        // Log the raw HTML so we can see exactly what the page returned
+        const html = await page.content();
+        log.info(`Page HTML snippet: ${html.substring(0, 2000)}`);
+
+        const pageText = (await page.textContent('body')) || '';
+        log.info(`Page text snippet: ${pageText.substring(0, 500)}`);
+
+        // ── No results check ──────────────────────────────────────────────────
         if (/no record/i.test(pageText) || /not found/i.test(pageText)) {
-            log.info('No inmate record found.');
+            log.info('No inmate record found on this page.');
             results.push({ found: false, name, mode, scrapedAt: new Date().toISOString() });
             return;
         }
 
-        // ── KEY FIX: Read "RELEASED" from listing page rows BEFORE navigating ─
-        // The site shows RELEASED in the Location column on search results.
-        // We capture this per-row here so we don't lose it after navigating away.
-        const listingData = await page.evaluate(() => {
-            const entries = [];
-            let originalOpen = window.open;
+        // ── Extract detail URLs + release status directly from HTML ───────────
+        // Parse the raw HTML to find InmDetails URLs and pair each with whether
+        // its table row contains the word "RELEASED"
+        const base = 'http://inmate-search.cobbsheriff.org/';
 
+        const entries = await page.evaluate((baseUrl) => {
+            const results = [];
+
+            // Walk each table row
             document.querySelectorAll('table tr').forEach(tr => {
-                const cells = Array.from(tr.querySelectorAll('td'));
-                if (cells.length === 0) return;
-
+                const rowHtml = tr.innerHTML || '';
                 const rowText = tr.innerText || '';
-                const rowReleased = /released/i.test(rowText);
 
-                const btn = tr.querySelector('button, input[type="button"]');
-                if (btn) {
-                    const btnText = (btn.innerText || btn.value || '').toLowerCase();
-                    if (/booking|detail|last|view/i.test(btnText)) {
-                        let capturedUrl = null;
-                        window.open = (url) => { capturedUrl = url; return null; };
-                        btn.click();
-                        window.open = originalOpen;
-                        if (capturedUrl) {
-                            entries.push({ url: capturedUrl, releasedOnListing: rowReleased });
-                        }
-                    }
+                // Look for InmDetails URL in this row's HTML
+                const urlMatch = rowHtml.match(/InmDetails\.asp\?[^"'<>\s]+/);
+                if (!urlMatch) return;
+
+                const rawUrl = urlMatch[0].replace(/&amp;/g, '&');
+                const fullUrl = rawUrl.startsWith('http') ? rawUrl : baseUrl + rawUrl;
+                const isReleased = /released/i.test(rowText);
+
+                results.push({ url: fullUrl, releasedOnListing: isReleased });
+            });
+
+            // Also check onclick attributes on buttons/inputs for sh() calls
+            document.querySelectorAll('button, input[type="button"]').forEach(btn => {
+                const onclick = btn.getAttribute('onclick') || '';
+                const match = onclick.match(/InmDetails\.asp\?[^"'<>\s)]+/);
+                if (!match) return;
+
+                const rawUrl = match[0].replace(/&amp;/g, '&');
+                const fullUrl = rawUrl.startsWith('http') ? rawUrl : baseUrl + rawUrl;
+
+                // Check if already captured
+                if (!results.find(r => r.url === fullUrl)) {
+                    const rowText = btn.closest('tr')?.innerText || '';
+                    results.push({ url: fullUrl, releasedOnListing: /released/i.test(rowText) });
                 }
             });
 
-            window.open = originalOpen;
-            return entries;
-        });
+            return results;
+        }, base);
 
-        log.info(`Listing entries: ${JSON.stringify(listingData)}`);
+        log.info(`Extracted entries from HTML: ${JSON.stringify(entries)}`);
 
-        const html = await page.content();
-        const htmlMatches = [...html.matchAll(/InmDetails\.asp\?[^"'<>\s]+/g)]
-            .map(m => m[0].replace(/&amp;/g, '&'));
-
-        const base = 'http://inmate-search.cobbsheriff.org/';
-        const listedUrls = new Set(listingData.map(e => e.url));
-        const extraUrls  = htmlMatches
-            .filter(u => !listedUrls.has(u))
-            .map(u => ({ url: u, releasedOnListing: null }));
-
-        const allEntries = [...listingData, ...extraUrls].map(e => ({
-            ...e,
-            url: e.url.startsWith('http') ? e.url : base + e.url,
-        }));
-
-        log.info(`Total detail entries: ${allEntries.length}`);
-
-        if (allEntries.length === 0) {
-            log.warning('No detail URLs found — scraping current page as-is');
-            const rows   = await scrapeTableRows(page);
-            const rawMap = parseTableToObject(rows);
-            const record = buildStructuredRecord(rawMap, page.url());
-            if (!isReleased(record)) {
-                log.info('Skipping — inmate still in custody');
-                return;
-            }
-            results.push({ found: true, ...record });
+        // ── If still nothing found, log full HTML for debugging ───────────────
+        if (entries.length === 0) {
+            log.warning(`Could not find any InmDetails URLs. Full HTML: ${html}`);
+            results.push({ found: false, name, mode, scrapedAt: new Date().toISOString(), debugHtml: html.substring(0, 5000) });
             return;
         }
 
-        for (const entry of allEntries) {
+        // ── Visit each released inmate's detail page ──────────────────────────
+        for (const entry of entries) {
             const { url: detailUrl, releasedOnListing } = entry;
 
-            if (releasedOnListing === false) {
-                log.info(`Skipping ${detailUrl} — listing shows in custody`);
+            log.info(`Entry: ${detailUrl} | releasedOnListing=${releasedOnListing}`);
+
+            if (!releasedOnListing) {
+                log.info(`Skipping — listing shows in custody`);
                 continue;
             }
 
-            log.info(`Navigating to detail: ${detailUrl} (listingReleased=${releasedOnListing})`);
+            log.info(`Navigating to detail page: ${detailUrl}`);
             try {
                 await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
                 await page.waitForSelector('table', { timeout: 30000 }).catch(() => {});
 
                 const rows   = await scrapeTableRows(page);
                 const rawMap = parseTableToObject(rows);
-                const record = buildStructuredRecord(rawMap, page.url());
+                const record = buildStructuredRecord(rawMap, page.url(), releasedOnListing);
 
-                const released = releasedOnListing === true ? true : isReleased(record);
-                log.info(`Parsed: ${record.name || '(unknown)'} | released=${released}`);
-
-                if (!released) {
-                    log.info('Skipping — inmate still in custody');
-                    continue;
-                }
-
+                log.info(`✅ Scraped released inmate: ${record.name || '(unknown)'}`);
                 results.push({ found: true, ...record });
 
             } catch (err) {
@@ -274,6 +261,11 @@ for (const record of results) {
 }
 
 const released = results.filter(r => r.found);
-console.log(`Done. Released inmates: ${released.length} found (in-custody records skipped).`);
+console.log(`Done. Released inmates: ${released.length} found.`);
 
 await Actor.exit();
+ENDOFFILE
+echo "Done"
+Output
+
+Done
