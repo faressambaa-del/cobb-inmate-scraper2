@@ -152,44 +152,80 @@ const crawler = new PlaywrightCrawler({
             return;
         }
 
-        const detailUrls = await page.evaluate(() => {
-            const captured = [];
-            const originalOpen = window.open;
-            window.open = (url) => { captured.push(url); return null; };
-            const buttons = Array.from(document.querySelectorAll('button, input[type="button"], a'));
-            for (const btn of buttons) {
-                const text = (btn.innerText || btn.value || btn.textContent || '').toLowerCase();
-                if (/booking|detail|last|view|inquiry/i.test(text)) btn.click();
-            }
+        // ── KEY FIX: Read "RELEASED" from listing page rows BEFORE navigating ─
+        // The site shows RELEASED in the Location column on search results.
+        // We capture this per-row here so we don't lose it after navigating away.
+        const listingData = await page.evaluate(() => {
+            const entries = [];
+            let originalOpen = window.open;
+
+            document.querySelectorAll('table tr').forEach(tr => {
+                const cells = Array.from(tr.querySelectorAll('td'));
+                if (cells.length === 0) return;
+
+                const rowText = tr.innerText || '';
+                const rowReleased = /released/i.test(rowText);
+
+                const btn = tr.querySelector('button, input[type="button"]');
+                if (btn) {
+                    const btnText = (btn.innerText || btn.value || '').toLowerCase();
+                    if (/booking|detail|last|view/i.test(btnText)) {
+                        let capturedUrl = null;
+                        window.open = (url) => { capturedUrl = url; return null; };
+                        btn.click();
+                        window.open = originalOpen;
+                        if (capturedUrl) {
+                            entries.push({ url: capturedUrl, releasedOnListing: rowReleased });
+                        }
+                    }
+                }
+            });
+
             window.open = originalOpen;
-            return captured;
+            return entries;
         });
+
+        log.info(`Listing entries: ${JSON.stringify(listingData)}`);
 
         const html = await page.content();
         const htmlMatches = [...html.matchAll(/InmDetails\.asp\?[^"'<>\s]+/g)]
             .map(m => m[0].replace(/&amp;/g, '&'));
 
         const base = 'http://inmate-search.cobbsheriff.org/';
-        const allDetailUrls = [...new Set([...detailUrls, ...htmlMatches])]
-            .map(u => u.startsWith('http') ? u : base + u);
+        const listedUrls = new Set(listingData.map(e => e.url));
+        const extraUrls  = htmlMatches
+            .filter(u => !listedUrls.has(u))
+            .map(u => ({ url: u, releasedOnListing: null }));
 
-        log.info(`Found ${allDetailUrls.length} detail URL(s)`);
+        const allEntries = [...listingData, ...extraUrls].map(e => ({
+            ...e,
+            url: e.url.startsWith('http') ? e.url : base + e.url,
+        }));
 
-        if (allDetailUrls.length === 0) {
+        log.info(`Total detail entries: ${allEntries.length}`);
+
+        if (allEntries.length === 0) {
             log.warning('No detail URLs found — scraping current page as-is');
-            const rows = await scrapeTableRows(page);
+            const rows   = await scrapeTableRows(page);
             const rawMap = parseTableToObject(rows);
             const record = buildStructuredRecord(rawMap, page.url());
             if (!isReleased(record)) {
-                log.info('⏭  Skipping — inmate still in custody');
+                log.info('Skipping — inmate still in custody');
                 return;
             }
             results.push({ found: true, ...record });
             return;
         }
 
-        for (const detailUrl of allDetailUrls) {
-            log.info(`Navigating to detail: ${detailUrl}`);
+        for (const entry of allEntries) {
+            const { url: detailUrl, releasedOnListing } = entry;
+
+            if (releasedOnListing === false) {
+                log.info(`Skipping ${detailUrl} — listing shows in custody`);
+                continue;
+            }
+
+            log.info(`Navigating to detail: ${detailUrl} (listingReleased=${releasedOnListing})`);
             try {
                 await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
                 await page.waitForSelector('table', { timeout: 30000 }).catch(() => {});
@@ -197,12 +233,12 @@ const crawler = new PlaywrightCrawler({
                 const rows   = await scrapeTableRows(page);
                 const rawMap = parseTableToObject(rows);
                 const record = buildStructuredRecord(rawMap, page.url());
-                const released = isReleased(record);
 
-                log.info(`✅ Parsed: ${record.name || '(unknown)'} | released=${released}`);
+                const released = releasedOnListing === true ? true : isReleased(record);
+                log.info(`Parsed: ${record.name || '(unknown)'} | released=${released}`);
 
                 if (!released) {
-                    log.info('⏭  Skipping — inmate still in custody');
+                    log.info('Skipping — inmate still in custody');
                     continue;
                 }
 
@@ -210,14 +246,24 @@ const crawler = new PlaywrightCrawler({
 
             } catch (err) {
                 log.error(`Failed to load ${detailUrl}: ${err.message}`);
-                results.push({ found: false, error: err.message, sourceUrl: detailUrl, scrapedAt: new Date().toISOString() });
+                results.push({
+                    found     : false,
+                    error     : err.message,
+                    sourceUrl : detailUrl,
+                    scrapedAt : new Date().toISOString(),
+                });
             }
         }
     },
 
     failedRequestHandler({ request, error, log }) {
         log.error(`Request failed: ${request.url} — ${error?.message}`);
-        results.push({ found: false, error: error?.message, sourceUrl: request.url, scrapedAt: new Date().toISOString() });
+        results.push({
+            found     : false,
+            error     : error?.message,
+            sourceUrl : request.url,
+            scrapedAt : new Date().toISOString(),
+        });
     },
 });
 
